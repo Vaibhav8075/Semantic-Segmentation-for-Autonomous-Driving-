@@ -1,0 +1,59 @@
+# =============================================================================
+# .gitignore — Semantic Segmentation Project
+# =============================================================================
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# PyTorch checkpoints & outputs
+checkpoints/
+outputs/
+*.pth
+*.pt
+*.onnx
+*.trt
+*.engine
+
+# Dataset (large files - download separately)
+dataset/
+cityscapes/
+data/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+runs/
+
+# Misc
+*.bak
+*.tmp
