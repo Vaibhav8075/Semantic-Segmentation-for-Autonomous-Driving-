@@ -36,13 +36,13 @@ This project implements an end-to-end perception module for autonomous vehicles 
 
 | Class | Color | Description |
 |-------|-------|-------------|
-| [Road] Road | Purple | Driveable road surface |
-| [Lane Marking] Lane Marking | Yellow | Lane lines and road markings |
-| [Vehicle] Vehicle | Dark Blue | Cars, trucks, buses, motorcycles, bicycles |
-| [Pedestrian] Pedestrian | Crimson | People and riders |
-| [Sidewalk] Sidewalk | Pink | Pedestrian walkways |
-| [Traffic Sign] Traffic Sign | Dark Yellow | Traffic signs and signals |
-| [Background] Background | Dark Gray | Buildings, vegetation, sky, etc. |
+| Road | Purple | Driveable road surface |
+| Lane Marking | Yellow | Lane lines and road markings |
+| Vehicle | Dark Blue | Cars, trucks, buses, motorcycles, bicycles |
+| Pedestrian | Crimson | People and riders |
+| Sidewalk | Pink | Pedestrian walkways |
+| Traffic Sign | Dark Yellow | Traffic signs and signals |
+| Background | Dark Gray | Buildings, vegetation, sky, etc. |
 
 ---
 
@@ -133,8 +133,8 @@ Combined Loss = CE + Dice + Focal
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/road-segmentation.git
-cd road-segmentation/road_segmentation
+git clone https://github.com/Vaibhav8075/Semantic-Segmentation-for-Autonomous-Driving-.git
+cd Semantic-Segmentation-for-Autonomous-Driving-
 
 # Create virtual environment
 python -m venv venv
@@ -372,6 +372,28 @@ python export.py --tensorrt-guide
 
 ---
 
+## Interactive Dashboard
+
+The project includes a Streamlit-based interactive web dashboard for real-time perception analysis.
+
+```bash
+# Install Streamlit (if not already installed)
+pip install streamlit
+
+# Launch the dashboard
+python -m streamlit run dashboard.py
+```
+
+The dashboard provides three main tabs:
+
+1. **Image Segmentation and Explainability** -- Upload or select a test image, run inference, and view the segmentation mask, overlay, confidence heatmap, and Grad-CAM class attention maps side by side.
+2. **Video Segmentation Playback** -- Upload a driving video (MP4/AVI/MOV) and watch the model process it frame-by-frame with a live overlay and FPS counter.
+3. **Live Webcam Perception** -- Stream from a local USB camera for real-time segmentation, or capture a browser webcam snapshot for instant analysis with Grad-CAM.
+
+Sidebar controls allow switching between model architectures, selecting different checkpoints, adjusting overlay transparency, and filtering which perception classes are displayed.
+
+---
+
 ## Project Structure
 
 ```
@@ -389,7 +411,9 @@ road_segmentation/
 ├── predict.py             # Inference (single/batch/webcam)
 ├── explainability.py      # Grad-CAM visualization
 ├── export.py              # ONNX export & TensorRT guide
+├── dashboard.py           # Streamlit interactive web dashboard
 ├── utils.py               # Visualization & utilities
+├── verify.py              # Quick verification script
 ├── requirements.txt       # Python dependencies
 ├── README.md              # This file
 ├── .gitignore             # Git ignore rules

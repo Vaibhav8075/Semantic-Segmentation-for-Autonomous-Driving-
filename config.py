@@ -62,7 +62,7 @@ CITYSCAPES_LABEL_MAP: Dict[int, int] = {
     33: 2,    # bicycle
 
     # Pedestrian (class 3)
-    24: 2,    # person — NOTE: mapped to 3 below
+    24: 3,    # person
     25: 3,    # rider
 
     # Sidewalk (class 4)
@@ -97,8 +97,6 @@ CITYSCAPES_LABEL_MAP: Dict[int, int] = {
     -1: 6,    # license plate
 }
 
-# Fix: person should map to Pedestrian (class 3)
-CITYSCAPES_LABEL_MAP[24] = 3
 
 # ImageNet normalization constants
 IMAGENET_MEAN: Tuple[float, ...] = (0.485, 0.456, 0.406)

@@ -3,7 +3,7 @@ train.py — Training Pipeline for Semantic Segmentation
 ========================================================
 
 Full-featured training pipeline with:
-- Mixed Precision Training (FP16 via torch.cuda.amp)
+- Mixed Precision Training (FP16 via torch.amp)
 - Gradient Clipping
 - Learning Rate Scheduling (Cosine, Plateau, Step)
 - Early Stopping
