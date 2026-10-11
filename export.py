@@ -8,7 +8,7 @@ Includes validation to ensure ONNX output matches PyTorch output.
 Also provides a detailed TensorRT deployment guide in the docstrings.
 
 Usage:
-    python export.py --model unet --checkpoint best_model.pth --format onnx
+    python export.py --checkpoint checkpoints/unet_best.pth --validate --benchmark
 
 Author: Vibhu
 Project: Production-Grade Semantic Segmentation for Autonomous Driving
@@ -17,14 +17,15 @@ Project: Production-Grade Semantic Segmentation for Autonomous Driving
 import argparse
 import logging
 import os
+import sys
 from typing import Optional, Tuple
 
 import numpy as np
 import torch
 
-from config import ModelConfig, NUM_CLASSES
-from model_factory import get_model
-from utils import get_device, load_checkpoint, setup_logging
+from config import ARCHITECTURES
+from model_factory import load_model_from_checkpoint
+from utils import setup_logging
 
 
 # ============================================================================
@@ -34,8 +35,8 @@ from utils import get_device, load_checkpoint, setup_logging
 def export_to_onnx(
     model: torch.nn.Module,
     output_path: str,
-    input_size: Tuple[int, int] = (512, 512),
-    opset_version: int = 17,
+    input_size: Tuple[int, int] = (512, 1024),
+    opset_version: int = 18,
     dynamic_batch: bool = True,
 ) -> str:
     """
@@ -49,7 +50,8 @@ def export_to_onnx(
         model: Trained PyTorch model.
         output_path: Path for the exported .onnx file.
         input_size: (H, W) input image dimensions.
-        opset_version: ONNX opset version (17 recommended).
+        opset_version: ONNX opset version (18 is the lowest the PyTorch 2.9
+            exporter implements natively).
         dynamic_batch: Enable dynamic batch size for flexible inference.
 
     Returns:
@@ -58,30 +60,31 @@ def export_to_onnx(
     model.eval()
     model.cpu()
 
-    # Create dummy input
-    dummy_input = torch.randn(1, 3, input_size[0], input_size[1])
+    # Dummy input with batch 2, so the exporter can't specialize batch=1
+    dummy_input = torch.randn(2, 3, input_size[0], input_size[1])
 
-    # Dynamic axes for flexible batch size
-    dynamic_axes = None
+    # Dynamic batch dimension (torch.export style)
+    dynamic_shapes = None
     if dynamic_batch:
-        dynamic_axes = {
-            "input": {0: "batch_size"},
-            "output": {0: "batch_size"},
-        }
+        dynamic_shapes = ({0: torch.export.Dim("batch_size", min=1, max=64)},)
 
-    # Export
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    common = dict(opset_version=opset_version, input_names=["input"],
+                  output_names=["output"], do_constant_folding=True)
 
-    torch.onnx.export(
-        model,
-        dummy_input,
-        output_path,
-        opset_version=opset_version,
-        input_names=["input"],
-        output_names=["output"],
-        dynamic_axes=dynamic_axes,
-        do_constant_folding=True,  # Optimize constant folding
-    )
+    try:
+        torch.onnx.export(model, (dummy_input,), output_path,
+                          dynamo=True, dynamic_shapes=dynamic_shapes, **common)
+    except Exception as e:
+        # torch.export can't keep the batch dimension symbolic through some
+        # third-party code (e.g. Hugging Face SegFormer); the TorchScript-based
+        # exporter handles those models.
+        logging.warning(f"torch.export-based ONNX export failed ({type(e).__name__}); "
+                        f"retrying with the TorchScript exporter.")
+        dynamic_axes = ({"input": {0: "batch_size"}, "output": {0: "batch_size"}}
+                        if dynamic_batch else None)
+        torch.onnx.export(model, (dummy_input,), output_path,
+                          dynamo=False, dynamic_axes=dynamic_axes, **common)
 
     # Get file size
     file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
@@ -93,9 +96,9 @@ def export_to_onnx(
 def validate_onnx(
     pytorch_model: torch.nn.Module,
     onnx_path: str,
-    input_size: Tuple[int, int] = (512, 512),
+    input_size: Tuple[int, int] = (512, 1024),
     rtol: float = 1e-3,
-    atol: float = 1e-5,
+    atol: float = 1e-4,
 ) -> bool:
     """
     Validate ONNX model output matches PyTorch model output.
@@ -138,23 +141,22 @@ def validate_onnx(
     session = ort.InferenceSession(onnx_path)
     onnx_output = session.run(None, {"input": test_input})[0]
 
-    # Compare
-    try:
-        np.testing.assert_allclose(pytorch_output, onnx_output, rtol=rtol, atol=atol)
+    # Compare logits (float32 kernels differ slightly) and predicted classes
+    max_diff = np.abs(pytorch_output - onnx_output).max()
+    same_class = (pytorch_output.argmax(1) == onnx_output.argmax(1)).mean()
+    logits_ok = np.allclose(pytorch_output, onnx_output, rtol=rtol, atol=atol)
+    log = logging.info if logits_ok else logging.warning
+    log(f"Max absolute logit difference: {max_diff:.3e} "
+        f"({'within' if logits_ok else 'outside'} rtol={rtol}, atol={atol})")
+    logging.info(f"Pixels with the same predicted class: {100 * same_class:.4f}%")
+    if logits_ok:
         logging.info("ONNX output matches PyTorch output [OK]")
-        max_diff = np.abs(pytorch_output - onnx_output).max()
-        logging.info(f"Maximum absolute difference: {max_diff:.6e}")
-        return True
-    except AssertionError as e:
-        logging.warning(f"ONNX output mismatch: {e}")
-        max_diff = np.abs(pytorch_output - onnx_output).max()
-        logging.warning(f"Maximum absolute difference: {max_diff:.6e}")
-        return False
+    return bool(logits_ok)
 
 
 def benchmark_onnx(
     onnx_path: str,
-    input_size: Tuple[int, int] = (512, 512),
+    input_size: Tuple[int, int] = (512, 1024),
     num_runs: int = 50,
 ) -> dict:
     """
@@ -175,7 +177,10 @@ def benchmark_onnx(
         logging.warning("onnxruntime not installed")
         return {}
 
-    session = ort.InferenceSession(onnx_path)
+    providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider")
+                 if p in ort.get_available_providers()]
+    session = ort.InferenceSession(onnx_path, providers=providers)
+    logging.info(f"ONNX Runtime providers: {session.get_providers()}")
     test_input = np.random.randn(1, 3, input_size[0], input_size[1]).astype(np.float32)
 
     # Warmup
@@ -198,7 +203,9 @@ def benchmark_onnx(
         "fps": 1000.0 / np.mean(times),
     }
 
-    print(f"\n  ONNX Inference Benchmark ({num_runs} runs):")
+    stats["provider"] = session.get_providers()[0]
+    print(f"\n  ONNX Inference Benchmark ({num_runs} runs, {stats['provider']}, "
+          f"input {input_size[0]}x{input_size[1]}):")
     print(f"    Mean: {stats['mean_ms']:.2f} ms")
     print(f"    Std:  {stats['std_ms']:.2f} ms")
     print(f"    Min:  {stats['min_ms']:.2f} ms")
@@ -237,10 +244,10 @@ Step 2: Convert ONNX to TensorRT Engine
   trtexec --onnx=model.onnx \\
           --saveEngine=model.engine \\
           --fp16 \\
-          --workspace=4096 \\
-          --minShapes=input:1x3x512x512 \\
-          --optShapes=input:4x3x512x512 \\
-          --maxShapes=input:8x3x512x512
+          --memPoolSize=workspace:4096 \\
+          --minShapes=input:1x3x512x1024 \\
+          --optShapes=input:4x3x512x1024 \\
+          --maxShapes=input:8x3x512x1024
 
   # Option B: Using Python API
   import tensorrt as trt
@@ -277,8 +284,8 @@ Step 3: Run Inference with TensorRT
   context = engine.create_execution_context()
 
   # Allocate buffers
-  input_shape = (1, 3, 512, 512)
-  output_shape = (1, 7, 512, 512)
+  input_shape = (1, 3, 512, 1024)
+  output_shape = (1, NUM_CLASSES, 512, 1024)  # NUM_CLASSES = 6
 
   d_input = cuda.mem_alloc(np.prod(input_shape) * 4)
   d_output = cuda.mem_alloc(np.prod(output_shape) * 4)
@@ -291,15 +298,9 @@ Step 3: Run Inference with TensorRT
   output = np.empty(output_shape, dtype=np.float32)
   cuda.memcpy_dtoh(output, d_output)
 
-Expected Performance Improvements:
-  ┌──────────────────┬──────────┬──────────┬──────────┐
-  │ Framework        │ FP32     │ FP16     │ INT8     │
-  ├──────────────────┼──────────┼──────────┼──────────┤
-  │ PyTorch          │ ~50ms    │ ~25ms    │ N/A      │
-  │ ONNX Runtime     │ ~40ms    │ ~20ms    │ N/A      │
-  │ TensorRT         │ ~15ms    │ ~8ms     │ ~5ms     │
-  └──────────────────┴──────────┴──────────┴──────────┘
-  * Times are approximate for 512×512 input on RTX 3080
+Expected gains: TensorRT FP16 is typically several times faster than
+ONNX Runtime FP32 on the same GPU, and INT8 (with calibration) faster still.
+Measure on your own hardware with `trtexec --loadEngine=model.engine`.
 
 ================================================================================
 """
@@ -313,16 +314,18 @@ def main():
     parser = argparse.ArgumentParser(
         description="Export segmentation model to deployment format"
     )
-    parser.add_argument("--model", type=str, required=True,
-                        choices=["unet", "resnet_unet", "deeplabv3plus", "segformer"])
-    parser.add_argument("--checkpoint", type=str, required=True,
+    parser.add_argument("--checkpoint", type=str, required=False,
                         help="Path to model checkpoint")
+    parser.add_argument("--model", type=str, default=None, choices=ARCHITECTURES,
+                        help="Model architecture (only needed for old checkpoints "
+                             "without metadata)")
     parser.add_argument("--format", type=str, default="onnx",
                         choices=["onnx"],
                         help="Export format")
     parser.add_argument("--output", type=str, default=None,
-                        help="Output file path (default: checkpoints/{model}.onnx)")
-    parser.add_argument("--image-size", type=int, nargs=2, default=[512, 512])
+                        help="Output file path (default: next to the checkpoint, .onnx)")
+    parser.add_argument("--image-size", type=int, nargs=2, default=None,
+                        help="Export input size H W (default: the size the model was trained at)")
     parser.add_argument("--validate", action="store_true",
                         help="Validate exported model against PyTorch")
     parser.add_argument("--benchmark", action="store_true",
@@ -332,38 +335,38 @@ def main():
 
     args = parser.parse_args()
 
+    # The ONNX exporter prints emoji; don't crash on legacy Windows consoles
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
+
     if args.tensorrt_guide:
         print(TENSORRT_GUIDE)
         return
 
+    if not args.checkpoint:
+        parser.error("--checkpoint is required")
+
     setup_logging()
 
-    # Load model
-    model_config = ModelConfig(architecture=args.model)
-    model = get_model(model_config)
-    load_checkpoint(args.checkpoint, model, device=torch.device("cpu"))
-    model.eval()
+    # Load model (architecture and input size come from the checkpoint)
+    model, meta = load_model_from_checkpoint(args.checkpoint, torch.device("cpu"), args.model)
+    input_size = tuple(args.image_size or meta["image_size"] or (512, 1024))
 
     # Determine output path
     if args.output is None:
-        args.output = os.path.join("checkpoints", f"{args.model}.onnx")
+        args.output = os.path.splitext(args.checkpoint)[0] + ".onnx"
 
     if args.format == "onnx":
-        # Export
-        onnx_path = export_to_onnx(
-            model, args.output,
-            input_size=tuple(args.image_size),
-        )
+        onnx_path = export_to_onnx(model, args.output, input_size=input_size)
 
-        # Validate
         if args.validate:
             print("\n  Validating ONNX export...")
-            validate_onnx(model, onnx_path, tuple(args.image_size))
+            validate_onnx(model, onnx_path, input_size)
 
-        # Benchmark
         if args.benchmark:
             print("\n  Benchmarking ONNX inference...")
-            benchmark_onnx(onnx_path, tuple(args.image_size))
+            benchmark_onnx(onnx_path, input_size)
 
     print(f"\n[OK] Export complete!")
     print(f"   Model: {args.output}")
