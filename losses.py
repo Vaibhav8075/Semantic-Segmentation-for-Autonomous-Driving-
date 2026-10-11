@@ -40,7 +40,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import LossConfig, NUM_CLASSES
+from config import IGNORE_INDEX, LossConfig, NUM_CLASSES
 
 
 # ============================================================================
@@ -69,7 +69,7 @@ class CrossEntropyLoss(nn.Module):
     def __init__(
         self,
         weight: Optional[torch.Tensor] = None,
-        ignore_index: int = 255,
+        ignore_index: int = IGNORE_INDEX,
         label_smoothing: float = 0.0,
     ):
         super().__init__()
@@ -123,7 +123,7 @@ class DiceLoss(nn.Module):
     def __init__(
         self,
         smooth: float = 1.0,
-        ignore_index: int = 255,
+        ignore_index: int = IGNORE_INDEX,
         reduction: str = "mean",
     ):
         super().__init__()
@@ -214,7 +214,7 @@ class FocalLoss(nn.Module):
         self,
         gamma: float = 2.0,
         alpha: Optional[float] = None,
-        ignore_index: int = 255,
+        ignore_index: int = IGNORE_INDEX,
         reduction: str = "mean",
     ):
         super().__init__()
@@ -309,7 +309,7 @@ class CombinedLoss(nn.Module):
         focal_weight: float = 1.0,
         focal_gamma: float = 2.0,
         class_weights: Optional[torch.Tensor] = None,
-        ignore_index: int = 255,
+        ignore_index: int = IGNORE_INDEX,
         label_smoothing: float = 0.0,
     ):
         super().__init__()

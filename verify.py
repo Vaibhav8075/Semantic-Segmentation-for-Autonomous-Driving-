@@ -1,6 +1,7 @@
 """Quick verification script for the semantic segmentation project."""
 import torch
-import sys
+
+from config import NUM_CLASSES
 
 if __name__ == "__main__":
     print("=" * 60)
@@ -11,8 +12,8 @@ if __name__ == "__main__":
     print("\n[1] Testing Loss Functions...")
     from losses import CrossEntropyLoss, DiceLoss, FocalLoss, CombinedLoss
 
-    pred = torch.randn(2, 7, 64, 64)
-    target = torch.randint(0, 7, (2, 64, 64))
+    pred = torch.randn(2, NUM_CLASSES, 64, 64)
+    target = torch.randint(0, NUM_CLASSES, (2, 64, 64))
 
     losses = {
         "CrossEntropy": CrossEntropyLoss(),
@@ -29,9 +30,9 @@ if __name__ == "__main__":
     print("\n[2] Testing Metrics...")
     from metrics import SegmentationMetrics
 
-    m = SegmentationMetrics(7)
-    preds = torch.randint(0, 7, (4, 64, 64))
-    targets = torch.randint(0, 7, (4, 64, 64))
+    m = SegmentationMetrics(NUM_CLASSES)
+    preds = torch.randint(0, NUM_CLASSES, (4, 64, 64))
+    targets = torch.randint(0, NUM_CLASSES, (4, 64, 64))
     # Make 70% match
     match = torch.rand(4, 64, 64) > 0.3
     preds[match] = targets[match]
@@ -47,10 +48,10 @@ if __name__ == "__main__":
 
     x = torch.randn(2, 3, 256, 256)
     models_test = {
-        "UNet": UNet(num_classes=7),
-        "ResNet50-UNet": ResNetUNet(num_classes=7, pretrained=False),
-        "DeepLabV3+": DeepLabV3Plus(num_classes=7, pretrained=False),
-        "SegFormer-B0": SegFormer(num_classes=7, variant="b0"),
+        "UNet": UNet(num_classes=NUM_CLASSES),
+        "ResNet50-UNet": ResNetUNet(num_classes=NUM_CLASSES, pretrained=False),
+        "DeepLabV3+": DeepLabV3Plus(num_classes=NUM_CLASSES, pretrained=False),
+        "SegFormer-B0": SegFormer(num_classes=NUM_CLASSES, variant="b0"),
     }
 
     for name, model in models_test.items():
@@ -66,6 +67,7 @@ if __name__ == "__main__":
     from dataset import get_dataloaders
 
     config = Config()
+    config.data.num_workers = 0
     train_loader, val_loader, test_loader = get_dataloaders(config, use_mock=True)
     batch = next(iter(train_loader))
     images, masks = batch

@@ -36,27 +36,28 @@ from config import CLASS_COLORS, CLASS_NAMES, IMAGENET_MEAN, IMAGENET_STD, NUM_C
 # REPRODUCIBILITY
 # ============================================================================
 
-def seed_everything(seed: int = 42) -> None:
+def seed_everything(seed: int = 42, deterministic: bool = False) -> None:
     """
-    Set random seeds for full reproducibility across Python, NumPy, and PyTorch.
+    Seed Python, NumPy, and PyTorch.
 
     Args:
         seed: Random seed value.
+        deterministic: Also force deterministic cuDNN kernels. Bit-exact
+            reruns, but noticeably slower; otherwise cuDNN autotuning is on.
     """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
     os.environ["PYTHONHASHSEED"] = str(seed)
-    logging.info(f"Random seed set to {seed} for reproducibility.")
+    logging.info(f"Random seed set to {seed} (deterministic cuDNN: {deterministic}).")
 
 
 def get_device() -> torch.device:
     """Get the best available device (CUDA > CPU)."""
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
         device = torch.device("cuda")
         logging.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
     else:
@@ -300,7 +301,9 @@ def visualize_predictions(
     """
     num_samples = min(num_samples, len(images))
 
-    fig, axes = plt.subplots(num_samples, 4, figsize=(20, 5 * num_samples))
+    # Row height follows the image aspect ratio (no blank space for wide images)
+    aspect = images[0].shape[0] / images[0].shape[1]
+    fig, axes = plt.subplots(num_samples, 4, figsize=(20, 5 * aspect * num_samples + 1))
 
     if num_samples == 1:
         axes = axes[np.newaxis, :]
@@ -482,6 +485,8 @@ def save_checkpoint(
     best_metric: float,
     history: Dict,
     save_path: str,
+    extra: Optional[Dict] = None,
+    include_training_state: bool = True,
 ) -> None:
     """
     Save a training checkpoint with all state needed to resume.
@@ -495,19 +500,27 @@ def save_checkpoint(
         best_metric: Best validation metric so far.
         history: Training history dictionary.
         save_path: Path to save checkpoint.
+        extra: Additional entries, e.g. model_config, class_names, image_size,
+            early_stopping state (see Trainer._checkpoint_extra).
+        include_training_state: Store optimizer/scheduler/scaler state (needed
+            to resume). False gives a much smaller, inference-only file.
     """
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
 
     checkpoint = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-        "scaler_state_dict": scaler.state_dict() if scaler else None,
+        "optimizer_state_dict": optimizer.state_dict() if include_training_state else None,
+        "scheduler_state_dict": scheduler.state_dict() if scheduler and include_training_state else None,
+        "scaler_state_dict": scaler.state_dict() if scaler and include_training_state else None,
         "best_metric": best_metric,
         "history": history,
+        **(extra or {}),
     }
-    torch.save(checkpoint, save_path)
+    # Write to a temp file first so an interrupted save can't corrupt the checkpoint
+    tmp_path = save_path + ".tmp"
+    torch.save(checkpoint, tmp_path)
+    os.replace(tmp_path, save_path)
     logging.info(f"Checkpoint saved to {save_path} (epoch {epoch})")
 
 
@@ -537,8 +550,13 @@ def load_checkpoint(
 
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    if optimizer and "optimizer_state_dict" in checkpoint:
+    if optimizer and checkpoint.get("optimizer_state_dict"):
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    elif optimizer:
+        logging.warning(
+            f"{checkpoint_path} has no optimizer state (inference-only checkpoint); "
+            f"resume from the *_latest.pth checkpoint to continue training exactly."
+        )
 
     if scheduler and checkpoint.get("scheduler_state_dict"):
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -555,6 +573,10 @@ def load_checkpoint(
         "epoch": checkpoint.get("epoch", 0),
         "best_metric": checkpoint.get("best_metric", 0.0),
         "history": checkpoint.get("history", {}),
+        "early_stopping": checkpoint.get("early_stopping"),
+        "model_config": checkpoint.get("model_config"),
+        "image_size": checkpoint.get("image_size"),
+        "class_names": checkpoint.get("class_names"),
     }
 
 
@@ -619,6 +641,15 @@ class EarlyStopping:
                 )
 
         return self.should_stop
+
+    def state_dict(self) -> Dict:
+        return {"counter": self.counter, "best_value": self.best_value,
+                "should_stop": self.should_stop}
+
+    def load_state_dict(self, state: Dict) -> None:
+        self.counter = state["counter"]
+        self.best_value = state["best_value"]
+        self.should_stop = state["should_stop"]
 
 
 # ============================================================================

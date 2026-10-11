@@ -20,7 +20,7 @@ Project: Production-Grade Semantic Segmentation for Autonomous Driving
 import os
 import tempfile
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import matplotlib.pyplot as plt
@@ -77,42 +77,73 @@ st.markdown(
 
 
 @st.cache_resource
-def load_predictor(model_name: str, checkpoint_path: str, image_size: Tuple[int, int]) -> SegmentationPredictor:
-    """Cache model loading so it doesn't reload on every interaction."""
-    return SegmentationPredictor(
-        model_name=model_name,
-        checkpoint_path=checkpoint_path,
-        image_size=image_size,
-    )
+def load_predictor(checkpoint_path: str, image_size: Optional[Tuple[int, int]]) -> SegmentationPredictor:
+    """Cache model loading so it doesn't reload on every interaction.
+
+    The architecture and default input size are read from the checkpoint.
+    """
+    return SegmentationPredictor(checkpoint_path=checkpoint_path, image_size=image_size)
+
+
+def render_gradcam(image: np.ndarray, mask: np.ndarray) -> None:
+    """Grad-CAM attention maps for the classes present in the prediction."""
+    gc_cols = st.columns(4)
+    col_index = 0
+    tensor_input = predictor.preprocess(image)[0]
+    h, w = image.shape[:2]
+
+    # The context manager removes the hooks again, so the cached model stays clean
+    with SegmentationGradCAM(predictor.model, device=predictor.device) as gradcam:
+        for c_idx in np.unique(mask):
+            class_name = CLASS_NAMES[c_idx]
+            if selected_classes and class_name not in selected_classes:
+                continue
+            heatmap = gradcam.generate(tensor_input, int(c_idx))
+            heatmap_resized = cv2.resize(heatmap, (w, h))
+
+            heatmap_uint8 = (heatmap_resized * 255).astype(np.uint8)
+            heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+            heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
+            gc_overlay = cv2.addWeighted(image, 0.6, heatmap_colored, 0.4, 0)
+
+            gc_cols[col_index % 4].image(
+                gc_overlay, caption=f"Attention Map: {class_name}", width="stretch"
+            )
+            col_index += 1
 
 
 # Sidebar Configuration
 st.sidebar.title(" Model Configuration")
 
-# Model Architecture
-model_name = st.sidebar.selectbox(
-    "Select Model Architecture",
-    ["unet", "resnet_unet", "deeplabv3plus", "segformer"],
-    index=0,
-)
-
-# Locate Checkpoints
+# Locate Checkpoints (the architecture is stored inside each checkpoint)
 checkpoint_dir = "./checkpoints"
 available_checkpoints = []
 if os.path.exists(checkpoint_dir):
-    available_checkpoints = [
+    available_checkpoints = sorted(
         os.path.join(checkpoint_dir, f) for f in os.listdir(checkpoint_dir) if f.endswith(".pth")
-    ]
+    )
 
 if not available_checkpoints:
     st.sidebar.warning("No checkpoint checkpoints/*.pth files found. Please train a model first.")
     checkpoint_path = st.sidebar.text_input("Manual Checkpoint Path", "checkpoints/best_model.pth")
 else:
+    # Default to a model trained on real data (Cityscapes), SegFormer first
+    def _priority(path: str) -> tuple:
+        name = os.path.basename(path)
+        return ("cityscapes" not in name, not name.endswith("_best.pth"), "segformer" not in name, name)
+
+    available_checkpoints.sort(key=_priority)
     checkpoint_path = st.sidebar.selectbox("Select Model Checkpoint", available_checkpoints, index=0)
 
-# Image size for processing
-img_size_str = st.sidebar.selectbox("Inference Processing Size", ["128x128", "256x256", "512x512"], index=0)
-h_size, w_size = map(int, img_size_str.split("x"))
+# Image size for processing (default: the resolution the model was trained at)
+TRAINED_SIZE = "Training resolution"
+img_size_str = st.sidebar.selectbox(
+    "Inference Processing Size",
+    [TRAINED_SIZE, "256x512", "384x768", "512x1024"],
+    index=0,
+    help="Smaller sizes run faster but lose detail on small objects.",
+)
+image_size = None if img_size_str == TRAINED_SIZE else tuple(map(int, img_size_str.split("x")))
 
 # Visual Adjustments
 st.sidebar.title(" Visual Adjustments")
@@ -155,7 +186,12 @@ tab1, tab2, tab3 = st.tabs([
 predictor = None
 if os.path.exists(checkpoint_path):
     try:
-        predictor = load_predictor(model_name, checkpoint_path, (h_size, w_size))
+        predictor = load_predictor(checkpoint_path, image_size)
+        st.sidebar.success(
+            f"Loaded **{predictor.architecture}** "
+            f"(input {predictor.image_size[0]}x{predictor.image_size[1]}, "
+            f"best val mIoU {predictor.meta['best_metric']:.3f})"
+        )
     except Exception as e:
         st.error(f"Error loading model checkpoint: {e}")
 else:
@@ -180,21 +216,21 @@ with tab1:
     st.header(" Image Segmentation")
     col_input, col_action = st.columns([1, 1])
 
-    # Sample option list
-    sample_dir = "./dataset/images/test"
+    # Sample option list (e.g. C:/datasets/cityscapes_prepared/images/test for real scenes)
+    sample_dir = col_input.text_input("Test images folder", "./dataset/images/test")
     sample_files = []
     if os.path.exists(sample_dir):
         sample_files = sorted([f for f in os.listdir(sample_dir) if f.endswith((".png", ".jpg", ".jpeg"))])
 
-    input_mode = col_input.radio("Choose Input Image Source:", ["Use Mock Dataset Image", "Upload Custom Image"])
+    input_mode = col_input.radio("Choose Input Image Source:", ["Use Dataset Test Image", "Upload Custom Image"])
 
     image_to_process = None
 
-    if input_mode == "Use Mock Dataset Image":
+    if input_mode == "Use Dataset Test Image":
         if not sample_files:
-            col_input.warning("No mock test images found. Generate mock dataset first.")
+            col_input.warning("No test images found. Run prepare_dataset.py first.")
         else:
-            selected_sample = col_input.selectbox("Select Mock Test Image", sample_files, index=0)
+            selected_sample = col_input.selectbox("Select Test Image", sample_files, index=0)
             sample_path = os.path.join(sample_dir, selected_sample)
             image_to_process = cv2.imread(sample_path)
             image_to_process = cv2.cvtColor(image_to_process, cv2.COLOR_BGR2RGB)
@@ -206,10 +242,10 @@ with tab1:
             image_to_process = cv2.cvtColor(image_to_process, cv2.COLOR_BGR2RGB)
 
     if image_to_process is not None:
-        col_input.image(image_to_process, caption="Selected Input Image", use_container_width=True)
+        col_input.image(image_to_process, caption="Selected Input Image", width="stretch")
 
         if predictor is not None:
-            if col_action.button(" Run Segmenter & Explainability", use_container_width=True):
+            if col_action.button(" Run Segmenter & Explainability", width="stretch"):
                 with st.spinner("Processing image and running model backprop..."):
                     # Step 1: Predict
                     results = predictor.predict(image_to_process)
@@ -223,50 +259,26 @@ with tab1:
                     # Show outputs in 2x2 grid
                     st.success("Perception analysis complete!")
                     o_col1, o_col2 = st.columns(2)
-                    
-                    o_col1.image(custom_colored_mask, caption="Predicted Masks Map", use_container_width=True)
-                    o_col2.image(custom_overlay, caption=f"Semantic Overlay (Alpha={alpha})", use_container_width=True)
+
+                    o_col1.image(custom_colored_mask, caption="Predicted Masks Map", width="stretch")
+                    o_col2.image(custom_overlay, caption=f"Semantic Overlay (Alpha={alpha})", width="stretch")
 
                     o_col1_2, o_col2_2 = st.columns(2)
-                    
+
                     # Color map for confidence
                     conf_uint8 = (confidence * 255).astype(np.uint8)
                     conf_colored = cv2.applyColorMap(conf_uint8, cv2.COLORMAP_JET)
                     conf_colored = cv2.cvtColor(conf_colored, cv2.COLOR_BGR2RGB)
-                    o_col1_2.image(conf_colored, caption="Inference Pixel Confidence Heatmap (Jet Map)", use_container_width=True)
+                    o_col1_2.image(conf_colored, caption="Inference Pixel Confidence Heatmap (Jet Map)", width="stretch")
 
                     # Explainability: Grad-CAM
                     st.divider()
                     st.subheader(" Grad-CAM Explainability (Class Attention Heatmaps)")
                     st.info(
-                        "Grad-CAM computes gradients w.r.t. specific classes to show which exact pixels "
-                        "the model 'looked at' to verify safety-critical features (like pedestrians)."
+                        "Grad-CAM computes gradients w.r.t. specific classes to show which image "
+                        "regions drove the prediction for safety-critical classes (like pedestrians)."
                     )
-
-                    gradcam = SegmentationGradCAM(predictor.model, device=predictor.device)
-                    tensor_input = predictor.preprocess(image_to_process)[0]
-
-                    # Generate attention grid for classes present
-                    gc_cols = st.columns(4)
-                    col_index = 0
-                    
-                    unique_classes = np.unique(mask)
-                    for c_idx in unique_classes:
-                        class_name = CLASS_NAMES[c_idx]
-                        if not selected_classes or class_name in selected_classes:
-                            heatmap = gradcam.generate(tensor_input, int(c_idx))
-                            h, w = image_to_process.shape[:2]
-                            heatmap_resized = cv2.resize(heatmap, (w, h))
-
-                            # Create heatmap overlay
-                            heatmap_uint8 = (heatmap_resized * 255).astype(np.uint8)
-                            heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
-                            heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
-                            gc_overlay = cv2.addWeighted(image_to_process, 0.6, heatmap_colored, 0.4, 0)
-
-                            current_col = gc_cols[col_index % 4]
-                            current_col.image(gc_overlay, caption=f"Attention Map: {class_name}", use_container_width=True)
-                            col_index += 1
+                    render_gradcam(image_to_process, mask)
 
 
 # TAB 2: VIDEO SEGMENTATION
@@ -279,30 +291,26 @@ with tab2:
 
     video_file = st.file_uploader("Upload Video File (MP4, AVI, MOV)", type=["mp4", "avi", "mov"])
 
-    if video_file is not None:
-        tfile = tempfile.NamedTemporaryFile(delete=False)
-        tfile.write(video_file.read())
-        tfile.close()
+    if video_file is not None and predictor is not None:
+        if st.button(" Start Video Segmentation", width="stretch"):
+            suffix = os.path.splitext(video_file.name)[1]
+            tfile = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            tfile.write(video_file.getvalue())
+            tfile.close()
+            cap = cv2.VideoCapture(tfile.name)
+            try:
+                total_frames = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+                orig_fps = cap.get(cv2.CAP_PROP_FPS)
+                fps = orig_fps if orig_fps > 0 else 30.0
+                st.write(f"Loaded Video Stats: Total Frames = **{total_frames}**, Original FPS = **{fps:.1f}**")
 
-        # OpenCV Video Capture
-        cap = cv2.VideoCapture(tfile.name)
-        
-        # Video Stats
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        orig_fps = cap.get(cv2.CAP_PROP_FPS)
-        fps = orig_fps if orig_fps > 0 else 30.0
-        st.write(f"Loaded Video Stats: Total Frames = **{total_frames}**, Original FPS = **{fps:.1f}**")
+                st_frame = st.image([])
+                progress_bar = st.progress(0.0)
+                fps_placeholder = st.empty()
 
-        # Playback container
-        st_frame = st.image([])
-        progress_bar = st.progress(0.0)
-        fps_placeholder = st.empty()
-
-        if predictor is not None:
-            if st.button(" Start Video Segmentation", use_container_width=True):
                 frame_idx = 0
                 start_time = time.time()
-                
+
                 while cap.isOpened():
                     ret, frame = cap.read()
                     if not ret:
@@ -311,8 +319,6 @@ with tab2:
                     # Convert BGR to RGB
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                    # Predict frame
-                    # Speed boost: downsample frame processing size, run inference, resize back
                     results = predictor.predict(frame_rgb)
                     mask = results["mask"]
 
@@ -321,20 +327,20 @@ with tab2:
                     overlay = cv2.addWeighted(frame_rgb, 1 - alpha, colored_mask, alpha, 0)
 
                     # Display frame in Streamlit
-                    st_frame.image(overlay, use_container_width=True)
+                    st_frame.image(overlay, width="stretch")
 
                     # Progress & Stats
                     frame_idx += 1
-                    progress = frame_idx / total_frames
-                    progress_bar.progress(progress)
-                    
+                    progress_bar.progress(min(1.0, frame_idx / total_frames))
+
                     elapsed = time.time() - start_time
                     current_fps = frame_idx / max(elapsed, 1e-4)
                     fps_placeholder.metric("Processing Playback Speed", f"{current_fps:.1f} FPS")
 
+                st.success("Video processing complete!")
+            finally:
                 cap.release()
                 os.unlink(tfile.name)
-                st.success("Video processing complete!")
 
 
 # TAB 3: LIVE WEBCAM PERCEPTION
@@ -343,30 +349,30 @@ with tab3:
     st.write(
         "Capture snapshots from your browser webcam or run a live webcam feed stream using your local camera."
     )
-    
+
     webcam_mode = st.radio("Choose Webcam Input Mode:", ["Live Camera Stream", "Webcam Snapshot"])
-    
+
     if webcam_mode == "Live Camera Stream":
         st.subheader("Live Camera Stream")
         st.write("Click 'Start Stream' to capture and segment your webcam feed in real-time. Uncheck 'Active' or click 'Stop Stream' to end.")
-        
+
         camera_id = st.number_input("Camera Device ID (typically 0 for built-in webcam)", min_value=0, max_value=10, value=0, step=1)
-        
+
         col_start, col_stop = st.columns(2)
-        start_pressed = col_start.button(" Start Stream", use_container_width=True)
-        stop_pressed = col_stop.button(" Stop Stream", use_container_width=True)
-        
+        start_pressed = col_start.button(" Start Stream", width="stretch")
+        stop_pressed = col_stop.button(" Stop Stream", width="stretch")
+
         if "webcam_streaming" not in st.session_state:
             st.session_state.webcam_streaming = False
-            
+
         if start_pressed:
             st.session_state.webcam_streaming = True
         if stop_pressed:
             st.session_state.webcam_streaming = False
-            
+
         st_webcam_frame = st.image([])
         fps_webcam_placeholder = st.empty()
-        
+
         if st.session_state.webcam_streaming and predictor is not None:
             cap_webcam = cv2.VideoCapture(int(camera_id))
             if not cap_webcam.isOpened():
@@ -381,81 +387,58 @@ with tab3:
                         if not ret:
                             st.warning("Failed to receive frame from camera. Stopping.")
                             break
-                            
+
                         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         results = predictor.predict(frame_rgb)
                         mask = results["mask"]
-                        
+
                         colored_mask = get_custom_colored_mask(mask)
                         overlay = cv2.addWeighted(frame_rgb, 1 - alpha, colored_mask, alpha, 0)
-                        
-                        st_webcam_frame.image(overlay, use_container_width=True)
-                        
+
+                        st_webcam_frame.image(overlay, width="stretch")
+
                         frame_count += 1
                         elapsed = time.time() - start_time
                         fps = frame_count / max(elapsed, 1e-4)
                         fps_webcam_placeholder.metric("Webcam Inference Speed", f"{fps:.1f} FPS")
-                        
+
                         # Short sleep to prevent CPU starvation and allow Streamlit state checks
                         time.sleep(0.01)
                 finally:
                     cap_webcam.release()
                     st_webcam_frame.empty()
-                    
+
     elif webcam_mode == "Webcam Snapshot":
         st.subheader("Webcam Snapshot")
         st.write("Snap a photo using your web browser's camera input to run prediction and attention explainability.")
-        
+
         camera_photo = st.camera_input("Capture Road Scene Snapshot")
-        
+
         if camera_photo is not None:
-            img = Image.open(camera_photo)
-            img_np = np.array(img)
-            
+            img_np = np.array(Image.open(camera_photo).convert("RGB"))
+
             st.success("Snapshot captured!")
-            
+
             if predictor is not None:
                 with st.spinner("Analyzing snapshot..."):
                     results = predictor.predict(img_np)
                     mask = results["mask"]
                     confidence = results["confidence"]
-                    
+
                     custom_colored_mask = get_custom_colored_mask(mask)
                     custom_overlay = cv2.addWeighted(img_np, 1 - alpha, custom_colored_mask, alpha, 0)
-                    
+
                     o_col1, o_col2 = st.columns(2)
-                    o_col1.image(custom_colored_mask, caption="Predicted Masks Map", use_container_width=True)
-                    o_col2.image(custom_overlay, caption=f"Semantic Overlay (Alpha={alpha})", use_container_width=True)
-                    
+                    o_col1.image(custom_colored_mask, caption="Predicted Masks Map", width="stretch")
+                    o_col2.image(custom_overlay, caption=f"Semantic Overlay (Alpha={alpha})", width="stretch")
+
                     o_col1_2, o_col2_2 = st.columns(2)
                     conf_uint8 = (confidence * 255).astype(np.uint8)
                     conf_colored = cv2.applyColorMap(conf_uint8, cv2.COLORMAP_JET)
                     conf_colored = cv2.cvtColor(conf_colored, cv2.COLOR_BGR2RGB)
-                    o_col1_2.image(conf_colored, caption="Inference Pixel Confidence Heatmap (Jet Map)", use_container_width=True)
-                    
+                    o_col1_2.image(conf_colored, caption="Inference Pixel Confidence Heatmap (Jet Map)", width="stretch")
+
                     st.divider()
                     st.subheader(" Grad-CAM Explainability (Class Attention Heatmaps)")
-                    
-                    gradcam = SegmentationGradCAM(predictor.model, device=predictor.device)
-                    tensor_input = predictor.preprocess(img_np)[0]
-                    
-                    gc_cols = st.columns(4)
-                    col_index = 0
-                    
-                    unique_classes = np.unique(mask)
-                    for c_idx in unique_classes:
-                        class_name = CLASS_NAMES[c_idx]
-                        if not selected_classes or class_name in selected_classes:
-                            heatmap = gradcam.generate(tensor_input, int(c_idx))
-                            h, w = img_np.shape[:2]
-                            heatmap_resized = cv2.resize(heatmap, (w, h))
-                            
-                            heatmap_uint8 = (heatmap_resized * 255).astype(np.uint8)
-                            heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
-                            heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
-                            gc_overlay = cv2.addWeighted(img_np, 0.6, heatmap_colored, 0.4, 0)
-                            
-                            current_col = gc_cols[col_index % 4]
-                            current_col.image(gc_overlay, caption=f"Attention Map: {class_name}", use_container_width=True)
-                            col_index += 1
+                    render_gradcam(img_np, mask)
 

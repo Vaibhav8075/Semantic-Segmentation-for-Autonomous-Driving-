@@ -53,6 +53,10 @@ desktop.ini
 # Logs
 *.log
 runs/
+logs/
+
+# Tests
+.pytest_cache/
 
 # Misc
 *.bak

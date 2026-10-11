@@ -12,15 +12,17 @@ Outputs per image:
 - Overlay image (semi-transparent mask on original)
 - Confidence map (per-pixel prediction confidence heatmap)
 
+The model architecture and input resolution are read from the checkpoint.
+
 Usage:
     # Single image
-    python predict.py --image sample.jpg --model unet --checkpoint best_model.pth
+    python predict.py --image sample.jpg --checkpoint checkpoints/unet_best.pth
 
     # Batch inference
-    python predict.py --image-dir ./test_images/ --model unet --checkpoint best_model.pth
+    python predict.py --image-dir ./test_images/ --checkpoint checkpoints/unet_best.pth
 
     # Webcam
-    python predict.py --webcam --model unet --checkpoint best_model.pth
+    python predict.py --webcam --checkpoint checkpoints/unet_best.pth
 
 Author: Vibhu
 Project: Production-Grade Semantic Segmentation for Autonomous Driving
@@ -39,22 +41,13 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from config import (
-    CLASS_COLORS,
-    CLASS_NAMES,
-    IMAGENET_MEAN,
-    IMAGENET_STD,
-    NUM_CLASSES,
-    Config,
-    ModelConfig,
-    PathConfig,
-)
-from model_factory import get_model
+from config import ARCHITECTURES, CLASS_COLORS, CLASS_NAMES
+from dataset import preprocess_image
+from model_factory import load_model_from_checkpoint
 from utils import (
     colorize_mask,
     create_overlay,
     get_device,
-    load_checkpoint,
     setup_logging,
 )
 
@@ -71,36 +64,38 @@ class SegmentationPredictor:
     for single images, batch directories, and real-time video streams.
 
     Args:
-        model_name: Architecture name.
         checkpoint_path: Path to trained model checkpoint.
-        image_size: (height, width) for input preprocessing.
+        model_name: Architecture name — only needed for old checkpoints that
+            don't record it.
+        image_size: (height, width) model input size. Defaults to the size
+            the model was trained at.
         device: Inference device.
     """
 
     def __init__(
         self,
-        model_name: str,
         checkpoint_path: str,
-        image_size: Tuple[int, int] = (512, 512),
+        model_name: Optional[str] = None,
+        image_size: Optional[Tuple[int, int]] = None,
         device: Optional[torch.device] = None,
     ):
         setup_logging()
-        self.image_size = image_size
         self.device = device or get_device()
 
-        # Load model
-        model_config = ModelConfig(architecture=model_name)
-        self.model = get_model(model_config).to(self.device)
+        self.model, self.meta = load_model_from_checkpoint(
+            checkpoint_path, self.device, model_name
+        )
+        self.architecture = self.meta["model_config"]["architecture"]
+        self.image_size = tuple(image_size or self.meta["image_size"] or (512, 1024))
 
-        # Load weights
-        load_checkpoint(checkpoint_path, self.model, device=self.device)
-        self.model.eval()
-
-        logging.info(f"Predictor ready: {model_name} on {self.device}")
+        logging.info(
+            f"Predictor ready: {self.architecture} on {self.device}, "
+            f"input {self.image_size[0]}x{self.image_size[1]}"
+        )
 
     def preprocess(self, image: np.ndarray) -> Tuple[torch.Tensor, Tuple[int, int]]:
         """
-        Preprocess an image for model input.
+        Preprocess an image for model input (same pipeline as evaluation).
 
         Args:
             image: RGB image as numpy array (H, W, 3).
@@ -109,21 +104,8 @@ class SegmentationPredictor:
             tensor: Preprocessed tensor (1, 3, H, W).
             original_size: (H, W) of the original image.
         """
-        original_size = image.shape[:2]
-
-        # Resize
-        resized = cv2.resize(image, (self.image_size[1], self.image_size[0]))
-
-        # Normalize (ImageNet)
-        normalized = resized.astype(np.float32) / 255.0
-        mean = np.array(IMAGENET_MEAN, dtype=np.float32)
-        std = np.array(IMAGENET_STD, dtype=np.float32)
-        normalized = (normalized - mean) / std
-
-        # To tensor: (H, W, 3) → (1, 3, H, W)
-        tensor = torch.from_numpy(normalized.transpose(2, 0, 1)).unsqueeze(0).float()
-
-        return tensor.to(self.device), original_size
+        tensor = preprocess_image(image, self.image_size)
+        return tensor.to(self.device), image.shape[:2]
 
     @torch.no_grad()
     def predict(
@@ -143,27 +125,22 @@ class SegmentationPredictor:
                 'confidence': Per-pixel confidence map (H, W), float32
                 'probabilities': Full probability map (H, W, C), float32
         """
+        if image.ndim == 3 and image.shape[2] == 4:
+            image = image[:, :, :3]
+
         tensor, original_size = self.preprocess(image)
 
-        # Model inference
-        logits = self.model(tensor)  # (1, C, H, W)
+        # Model inference, then upsample the logits (not the hard mask) back
+        # to the original resolution for smooth class boundaries
+        logits = self.model(tensor).float()  # (1, C, h, w)
+        logits = F.interpolate(logits, size=original_size, mode="bilinear", align_corners=False)
 
-        # Softmax probabilities
-        probs = F.softmax(logits, dim=1)  # (1, C, H, W)
+        probs = F.softmax(logits, dim=1)               # (1, C, H, W)
+        confidence, predictions = probs.max(dim=1)     # (1, H, W)
 
-        # Class predictions
-        confidence, predictions = probs.max(dim=1)  # (1, H, W)
-
-        # Convert to numpy
         mask = predictions[0].cpu().numpy().astype(np.int32)
         confidence_map = confidence[0].cpu().numpy()
         prob_map = probs[0].cpu().numpy().transpose(1, 2, 0)  # (H, W, C)
-
-        # Resize back to original size
-        h, w = original_size
-        mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
-        confidence_map = cv2.resize(confidence_map, (w, h))
-        mask = mask.astype(np.int32)
 
         # Generate visualizations
         colored_mask = colorize_mask(mask)
@@ -302,10 +279,10 @@ class SegmentationPredictor:
         """
         extensions = {".png", ".jpg", ".jpeg", ".bmp", ".tiff"}
 
-        image_files = [
+        image_files = sorted(
             f for f in os.listdir(image_dir)
             if os.path.splitext(f)[1].lower() in extensions
-        ]
+        )
 
         if not image_files:
             logging.warning(f"No images found in: {image_dir}")
@@ -432,15 +409,15 @@ def main():
                         help="Webcam device ID")
 
     # Model
-    parser.add_argument("--model", type=str, required=True,
-                        choices=["unet", "resnet_unet", "deeplabv3plus", "segformer"],
-                        help="Model architecture")
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to model checkpoint")
+    parser.add_argument("--model", type=str, default=None, choices=ARCHITECTURES,
+                        help="Model architecture (only needed for old checkpoints "
+                             "without metadata)")
 
     # Settings
-    parser.add_argument("--image-size", type=int, nargs=2, default=[512, 512],
-                        help="Input image size (H W)")
+    parser.add_argument("--image-size", type=int, nargs=2, default=None,
+                        help="Model input size H W (default: the size the model was trained at)")
     parser.add_argument("--output-dir", type=str, default="./outputs/predictions",
                         help="Output directory for results")
 
@@ -448,9 +425,9 @@ def main():
 
     # Initialize predictor
     predictor = SegmentationPredictor(
-        model_name=args.model,
         checkpoint_path=args.checkpoint,
-        image_size=tuple(args.image_size),
+        model_name=args.model,
+        image_size=tuple(args.image_size) if args.image_size else None,
     )
 
     # Run inference

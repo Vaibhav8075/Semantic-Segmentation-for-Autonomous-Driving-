@@ -7,7 +7,9 @@ Implements four semantic segmentation architectures from scratch:
 1. U-Net (fully from scratch)
 2. ResNet50-UNet (transfer learning encoder + custom decoder)
 3. DeepLabV3+ (ASPP + ResNet50 backbone)
-4. SegFormer (Mix Transformer encoder + MLP decoder)
+4. SegFormer (Mix Transformer encoder + MLP decoder) — native from-scratch
+   implementation, plus HFSegFormer which wraps Hugging Face's implementation
+   so the encoder can start from pretrained MiT weights
 
 All models share a common interface:
     model(x: Tensor[B, 3, H, W]) -> Tensor[B, num_classes, H, W]
@@ -415,11 +417,19 @@ class ResNetUNet(nn.Module):
     ):
         super().__init__()
 
+        self.freeze_encoder = freeze_encoder
         self.encoder = ResNetEncoder(pretrained=pretrained, freeze_layers=freeze_encoder)
         self.decoder = ResNetUNetDecoder(
             encoder_channels=self.encoder.channels,
             num_classes=num_classes,
         )
+
+    def train(self, mode: bool = True) -> "ResNetUNet":
+        """Keep a frozen encoder in eval mode so its BatchNorm statistics stay fixed."""
+        super().train(mode)
+        if self.freeze_encoder:
+            self.encoder.eval()
+        return self
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         features = self.encoder(x)
@@ -999,6 +1009,63 @@ class SegFormer(nn.Module):
         return logits
 
 
+class HFSegFormer(nn.Module):
+    """
+    SegFormer from Hugging Face `transformers`, with optional ImageNet-pretrained
+    Mix Transformer (MiT) encoder weights (`nvidia/mit-b0` … `nvidia/mit-b5`).
+
+    Transformers trained from scratch need far more data than Cityscapes
+    provides, so this is the variant to use for real training. The native
+    `SegFormer` class above stays as a from-scratch reference implementation.
+
+    Args:
+        num_classes: Number of segmentation classes.
+        variant: 'b0' … 'b5'.
+        pretrained: Download and load the pretrained MiT encoder.
+    """
+
+    def __init__(
+        self,
+        num_classes: int = NUM_CLASSES,
+        variant: str = "b2",
+        pretrained: bool = True,
+    ):
+        super().__init__()
+        from transformers import SegformerConfig, SegformerForSemanticSegmentation
+
+        assert variant in SegFormer.CONFIGS, f"Unknown variant: {variant}"
+        cfg = SegFormer.CONFIGS[variant]
+
+        if pretrained:
+            self.net = SegformerForSemanticSegmentation.from_pretrained(
+                f"nvidia/mit-{variant}",
+                num_labels=num_classes,
+                ignore_mismatched_sizes=True,
+            )
+        else:
+            self.net = SegformerForSemanticSegmentation(SegformerConfig(
+                num_labels=num_classes,
+                hidden_sizes=list(cfg["embed_dims"]),
+                depths=list(cfg["depths"]),
+                num_attention_heads=list(cfg["num_heads"]),
+                decoder_hidden_size=cfg["decode_dim"],
+            ))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        logits = self.net(pixel_values=x).logits  # (B, C, H/4, W/4)
+        return F.interpolate(logits, size=x.shape[2:],
+                             mode="bilinear", align_corners=False)
+
+
+def transformers_available() -> bool:
+    """True if the Hugging Face transformers package can be imported."""
+    try:
+        import transformers  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 # ============================================================================
 # MODEL SUMMARY
 # ============================================================================
@@ -1031,6 +1098,7 @@ def get_model_info() -> str:
 ║     - Efficient self-attention with spatial reduction            ║
 ║     - Lightweight all-MLP decoder                                ║
 ║     - ~25M parameters (B2 variant)                               ║
+║     - Pretrained MiT encoder via Hugging Face transformers       ║
 ║                                                                  ║
 ╚══════════════════════════════════════════════════════════════════╝
 """

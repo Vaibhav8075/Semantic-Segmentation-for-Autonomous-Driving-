@@ -73,7 +73,7 @@ def analyze_class_distribution(
         for c in range(NUM_CLASSES):
             class_counts[c] += np.sum(mask == c)
 
-    total_pixels = class_counts.sum()
+    total_pixels = max(int(class_counts.sum()), 1)  # labeled pixels (ignore index excluded)
 
     # ---- Bar Chart ----
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -276,8 +276,8 @@ def visualize_overlays(
     for row, data_idx in enumerate(indices):
         image, mask = dataset.get_raw_sample(data_idx)
 
-        # Resize for consistent display
-        display_size = (512, 512)
+        # Resize for consistent display (keep the aspect ratio)
+        display_size = (512, max(1, round(512 * image.shape[0] / image.shape[1])))
         image_resized = cv2.resize(image, display_size)
         mask_resized = cv2.resize(mask.astype(np.uint8), display_size, interpolation=cv2.INTER_NEAREST)
 
@@ -378,7 +378,7 @@ def run_eda(
 
     # Load dataset (raw, no augmentation)
     if use_mock:
-        dataset = MockSegDataset(num_samples=200, image_size=(512, 512))
+        dataset = MockSegDataset(num_samples=200, image_size=(512, 1024))
         print("  Using mock dataset (200 samples)")
     else:
         dataset = CityscapesSegDataset(
